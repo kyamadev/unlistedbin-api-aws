@@ -1,2 +1,4 @@
-./storage/local/
+./storage/local/*
 *.db
+.env
+*.json
