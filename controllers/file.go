@@ -1,28 +1,23 @@
 package controllers
 
 import (
+	"Unlistedbin-api/middleware"
 	"Unlistedbin-api/models"
-	"Unlistedbin-api/storage"
 	"archive/zip"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 
-	"github.com/gin-contrib/sessions"
 	"github.com/gin-gonic/gin"
 )
 
-var FileStorage storage.Storage
-
 func UploadFileHandler(c *gin.Context) {
-	session := sessions.Default(c)
-	userIDVal := session.Get("userID")
-	if userIDVal == nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+	userID, err := middleware.GetUserIDFromContext(c, DB)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Authentication failed", "details": err.Error()})
 		return
 	}
-	ownerID := userIDVal.(uint)
 
 	repoName := c.PostForm("repository_name")
 	if repoName == "" {
@@ -30,9 +25,8 @@ func UploadFileHandler(c *gin.Context) {
 	}
 	publicFlag := c.PostForm("public") == "true"
 
-	// サーバー側で新規リポジトリを生成
 	newRepo := models.Repository{
-		OwnerID: ownerID,
+		OwnerID: userID,
 		Name:    repoName,
 		Public:  publicFlag,
 	}
@@ -99,7 +93,7 @@ func UploadFileHandler(c *gin.Context) {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to open file in zip: %s", f.Name)})
 				return
 			}
-			// ストレージにファイルを保存（repoUUID は newRepo.UUID）
+			// ストレージにファイルを保存
 			savedPath, err := FileStorage.SaveFile(newRepo.UUID, f.Name, fr)
 			fr.Close()
 			if err != nil {
@@ -166,9 +160,15 @@ func FileViewerHandler(c *gin.Context) {
 
 	// 公開設定lookup
 	if !repo.Public {
-		session := sessions.Default(c)
-		sessUsername := session.Get("username")
-		if sessUsername == nil || sessUsername.(string) != urlUsername {
+		authenticatedVal, authenticated := c.Get("authenticated")
+		if !authenticated || authenticatedVal != true {
+			c.JSON(http.StatusForbidden, gin.H{"error": "Forbidden: Authentication required"})
+			return
+		}
+
+		// ユーザー名をチェック
+		usernameVal, exists := c.Get("username")
+		if !exists || usernameVal.(string) != urlUsername {
 			c.JSON(http.StatusForbidden, gin.H{"error": "Forbidden: Access denied"})
 			return
 		}

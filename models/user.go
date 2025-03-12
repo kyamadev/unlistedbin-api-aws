@@ -1,23 +1,18 @@
 package models
 
 import (
-	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
 )
 
 type User struct {
 	gorm.Model
-	Username string `gorm:"uniqueIndex" json:"username"`
-	Password string `json:"password"`
+	Username      string `gorm:"uniqueIndex" json:"username"`
+	Email         string `gorm:"uniqueIndex" json:"email"`
+	Password      string `json:"-"`                                       // Kept for backward compatibility, will be empty for Cognito users
+	CognitoID     string `gorm:"uniqueIndex" json:"cognito_id,omitempty"` // Cognito User ID
+	EmailVerified bool   `json:"email_verified"`
 }
 
-func (u *User) BeforeCreate(tx *gorm.DB) (err error) {
-	if u.Password != "" {
-		hashed, err := bcrypt.GenerateFromPassword([]byte(u.Password), bcrypt.DefaultCost)
-		if err != nil {
-			return err
-		}
-		u.Password = string(hashed)
-	}
-	return nil
+func (u *User) IsLocalUser() bool {
+	return u.CognitoID == ""
 }

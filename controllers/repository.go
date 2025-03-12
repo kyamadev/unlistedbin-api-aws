@@ -1,9 +1,9 @@
 package controllers
 
 import (
-	"net/http"
-
+	"Unlistedbin-api/middleware"
 	"Unlistedbin-api/models"
+	"net/http"
 
 	"github.com/gin-gonic/gin"
 )
@@ -14,12 +14,15 @@ func CreateRepository(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request"})
 		return
 	}
-	userID, exists := c.Get("userID")
-	if !exists {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+
+	userID, err := middleware.GetUserIDFromContext(c, DB)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Authentication failed", "details": err.Error()})
 		return
 	}
-	repo.OwnerID = userID.(uint)
+
+	repo.OwnerID = userID
+
 	if err := DB.Create(&repo).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Creation failed"})
 		return
@@ -28,13 +31,14 @@ func CreateRepository(c *gin.Context) {
 }
 
 func GetRepositories(c *gin.Context) {
-	userID, exists := c.Get("userID")
-	if !exists {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+	userID, err := middleware.GetUserIDFromContext(c, DB)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Authentication failed", "details": err.Error()})
 		return
 	}
+
 	var repos []models.Repository
-	if err := DB.Where("owner_id = ?", userID.(uint)).Find(&repos).Error; err != nil {
+	if err := DB.Where("owner_id = ?", userID).Find(&repos).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Query failed"})
 		return
 	}
@@ -55,11 +59,18 @@ func UpdateVisibility(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Repository not found"})
 		return
 	}
-	userID, exists := c.Get("userID")
-	if !exists || repo.OwnerID != userID.(uint) {
+
+	isOwner, err := middleware.OwnershipCheck(c, DB, repo.OwnerID)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Authentication failed", "details": err.Error()})
+		return
+	}
+
+	if !isOwner {
 		c.JSON(http.StatusForbidden, gin.H{"error": "No permission"})
 		return
 	}
+
 	repo.Public = payload.Public
 	if err := DB.Save(&repo).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Update failed"})
@@ -75,15 +86,23 @@ func DeleteRepository(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Repository not found"})
 		return
 	}
-	userID, exists := c.Get("userID")
-	if !exists || repo.OwnerID != userID.(uint) {
+
+	isOwner, err := middleware.OwnershipCheck(c, DB, repo.OwnerID)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Authentication failed", "details": err.Error()})
+		return
+	}
+
+	if !isOwner {
 		c.JSON(http.StatusForbidden, gin.H{"error": "No permission"})
 		return
 	}
+
 	if err := DB.Delete(&repo).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Deletion failed"})
 		return
 	}
+
 	if err := FileStorage.DeleteRepository(repo.UUID); err != nil {
 		c.JSON(http.StatusOK, gin.H{
 			"message":   "Repository deleted from DB, but failed to remove files from storage",

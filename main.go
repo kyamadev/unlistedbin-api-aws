@@ -6,9 +6,9 @@ import (
 	"os"
 	"time"
 
+	"github.com/joho/godotenv"
+
 	"github.com/gin-contrib/cors"
-	"github.com/gin-contrib/sessions"
-	"github.com/gin-contrib/sessions/cookie"
 	"github.com/gin-gonic/gin"
 	"gorm.io/driver/mysql"
 	"gorm.io/driver/sqlite"
@@ -22,6 +22,9 @@ import (
 )
 
 func main() {
+	if err := godotenv.Load(); err != nil {
+		log.Println("No .env file found, using environment variables")
+	}
 	config.LoadConfig()
 
 	var db *gorm.DB
@@ -41,21 +44,36 @@ func main() {
 
 	var fileStorage storage.Storage
 	if config.AppConfig.Env == "production" {
-		bucket := os.Getenv("S3_BUCKET")
-		if bucket == "" {
-			log.Fatal("S3_BUCKET env variable must be set in production")
+		s3Storage, err := storage.NewS3Storage(config.AppConfig.S3Region, config.AppConfig.S3Bucket)
+		if err != nil {
+			log.Fatalf("failed to initialize S3 storage: %v", err)
 		}
-		fileStorage = storage.NewS3Storage(bucket)
+		fileStorage = s3Storage
 	} else {
 		fileStorage = storage.NewLocalStorage(config.AppConfig.StoragePath)
 	}
 	controllers.FileStorage = fileStorage
 
-	r := gin.Default()
+	cognitoClient, err := controllers.NewCognitoClient(
+		config.AppConfig.CognitoRegion,
+		config.AppConfig.CognitoUserPoolID,
+		config.AppConfig.CognitoClientID,
+	)
+	if err != nil {
+		log.Fatalf("failed to initialize Cognito client: %v", err)
+	}
 
+	jwtValidator := middleware.NewCognitoJWTValidator(
+		config.AppConfig.CognitoRegion,
+		config.AppConfig.CognitoUserPoolID,
+		config.AppConfig.CognitoClientID,
+	)
+
+	r := gin.Default()
+	frontendURL := os.Getenv("FRONTEND_URL")
 	// CORS
 	r.Use(cors.New(cors.Config{
-		AllowOrigins:     []string{"http://localhost:3000"},
+		AllowOrigins:     []string{"http://localhost:3000", frontendURL},
 		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
 		AllowHeaders:     []string{"Origin", "Authorization", "Content-Type"},
 		ExposeHeaders:    []string{"Content-Length"},
@@ -63,37 +81,30 @@ func main() {
 		MaxAge:           12 * time.Hour,
 	}))
 
-	store := cookie.NewStore([]byte("secret-key"))
-	store.Options(sessions.Options{
-		Path:     "/",
-		MaxAge:   3600,
-		HttpOnly: true,
-		Secure:   false, // 開発環境では false、本番では true
-		SameSite: http.SameSiteLaxMode,
+	cognitoAuthController := controllers.NewCognitoAuthController(cognitoClient, db)
+
+	// Health check endpoint
+	r.GET("/api/health", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"status": "healthy"})
 	})
-	r.Use(sessions.Sessions("mysession", store))
+	r.POST("/api/auth/register", cognitoAuthController.RegisterHandler)
+	r.POST("/api/auth/login", cognitoAuthController.LoginHandler)
+	r.GET("/api/auth/check-username", cognitoAuthController.CheckUsernameAvailability)
+	r.POST("/api/auth/logout", cognitoAuthController.LogoutHandler)
 
-	r.GET("/api/auth/check-username", controllers.CheckUsernameHandler)
-	r.GET("/api/auth/session", controllers.SessionHandler)
-	r.POST("/api/auth/register", controllers.RegisterHandler)
-	r.POST("/api/auth/login", controllers.LoginHandler)
-	r.POST("/api/auth/logout", controllers.LogoutHandler)
-
-	// 認証が必要なAPI
 	authGroup := r.Group("/api")
-	authGroup.Use(middleware.SessionAuthMiddleware())
+	authGroup.Use(middleware.JWTAuthMiddleware(jwtValidator))
 	{
 		authGroup.GET("/repositories", controllers.GetRepositories)
 		authGroup.POST("/repositories", controllers.CreateRepository)
 		authGroup.DELETE("/repositories/:uuid", controllers.DeleteRepository)
 		authGroup.PUT("/repositories/:uuid/visibility", controllers.UpdateVisibility)
 		authGroup.POST("/files/upload", controllers.UploadFileHandler)
-		authGroup.PUT("/auth/update-username", controllers.UpdateUsernameHandler)
-		authGroup.DELETE("/auth/delete-account", controllers.DeleteAccountHandler)
+		authGroup.PUT("/auth/update-username", cognitoAuthController.UpdateUsernameHandler)
+		authGroup.DELETE("/auth/delete-account", cognitoAuthController.DeleteAccountHandler)
 	}
 
-	// 限定公開のファイルビューア
-	r.GET("/api/:username/:uuid/*filepath", controllers.FileViewerHandler)
+	r.GET("/api/:username/:uuid/*filepath", middleware.OptionalJWTAuthMiddleware(jwtValidator), controllers.FileViewerHandler)
 
 	r.Run(":8080")
 }
