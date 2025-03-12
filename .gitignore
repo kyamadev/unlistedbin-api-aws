@@ -1,4 +1,4 @@
 ./storage/local/*
 *.db
 .env
-*.json
+.env.test
