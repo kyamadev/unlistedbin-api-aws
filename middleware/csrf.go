@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -26,6 +27,25 @@ func GenerateCSRFToken() (string, error) {
 	}
 
 	return base64.StdEncoding.EncodeToString(bytes), nil
+}
+
+func normalizeToken(token string) string {
+	decoded, err := url.QueryUnescape(token)
+	if err != nil {
+		return strings.TrimSpace(token)
+	}
+	return strings.TrimSpace(decoded)
+}
+
+func tokensMatch(token1, token2 string) bool {
+	if token1 == token2 {
+		return true
+	}
+
+	norm1 := normalizeToken(token1)
+	norm2 := normalizeToken(token2)
+
+	return norm1 == norm2
 }
 
 func CSRFMiddleware() gin.HandlerFunc {
@@ -91,7 +111,6 @@ func CSRFMiddleware() gin.HandlerFunc {
 			isAuthEndpoint := strings.HasPrefix(path, "/api/auth/")
 
 			cookieToken, cookieErr := c.Cookie(CSRFTokenCookieName)
-
 			headerToken := c.GetHeader(CSRFHeaderName)
 
 			if isAuthEndpoint {
@@ -108,7 +127,6 @@ func CSRFMiddleware() gin.HandlerFunc {
 					return
 				}
 			} else {
-
 				if cookieErr != nil {
 					log.Printf("CSRF拒否: Cookie不足 (Path: %s)", path)
 					c.JSON(http.StatusForbidden, gin.H{"error": "CSRF token required"})
@@ -123,8 +141,14 @@ func CSRFMiddleware() gin.HandlerFunc {
 					return
 				}
 
-				if headerToken != cookieToken {
-					log.Printf("CSRF拒否: トークン不一致 (Path: %s)", path)
+				// トークンの比較
+				if !tokensMatch(headerToken, cookieToken) {
+					// 詳細なデバッグログ
+					normHeader := normalizeToken(headerToken)
+					normCookie := normalizeToken(cookieToken)
+					log.Printf("CSRF拒否: トークン不一致 (Path: %s)\nCookie: %s\nHeader: %s\nNormalizedCookie: %s\nNormalizedHeader: %s",
+						path, cookieToken, headerToken, normCookie, normHeader)
+
 					c.JSON(http.StatusForbidden, gin.H{"error": "CSRF token validation failed"})
 					c.Abort()
 					return
