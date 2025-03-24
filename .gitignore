@@ -1,4 +1,4 @@
-./storage/local/*
+local/*
 *.db
 .env
 .env.test

@@ -144,6 +144,7 @@ func UploadFileHandler(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "File uploaded successfully", "repo_uuid": newRepo.UUID})
 }
+
 func FileViewerHandler(c *gin.Context) {
 	urlUsername := c.Param("username")
 	repoUUID := c.Param("uuid")
@@ -158,22 +159,47 @@ func FileViewerHandler(c *gin.Context) {
 		return
 	}
 
-	// 公開設定lookup
-	if !repo.Public {
-		authenticatedVal, authenticated := c.Get("authenticated")
-		if !authenticated || authenticatedVal != true {
-			c.JSON(http.StatusForbidden, gin.H{"error": "Forbidden: Authentication required"})
-			return
-		}
+	if repo.Public {
+		serveRepositoryContent(c, repo, urlUsername, repoUUID, filePath)
+		return
+	}
 
-		// ユーザー名をチェック
-		usernameVal, exists := c.Get("username")
-		if !exists || usernameVal.(string) != urlUsername {
-			c.JSON(http.StatusForbidden, gin.H{"error": "Forbidden: Access denied"})
-			return
+	// 非公開リポジトリの場合はアクセス制御
+
+	// 認証チェック
+	authenticatedVal, authenticated := c.Get("authenticated")
+	if !authenticated || authenticatedVal != true {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Forbidden: Authentication required"})
+		return
+	}
+
+	// まず所有権のチェック - 所有者なら常にアクセス可能
+	userIDVal, userIDExists := c.Get("userID")
+	if userIDExists {
+		var user models.User
+		if err := DB.Where("cognito_id = ?", userIDVal).First(&user).Error; err == nil {
+			if user.ID == repo.OwnerID {
+				// リポジトリ所有者なのでアクセス許可
+				serveRepositoryContent(c, repo, urlUsername, repoUUID, filePath)
+				return
+			}
 		}
 	}
 
+	// 所有者でない場合はURLユーザー名との一致をチェック
+	usernameVal, exists := c.Get("username")
+	if !exists || usernameVal.(string) != urlUsername {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Forbidden: Access denied"})
+		return
+	}
+
+	// 上記チェックをすべて通過した場合、コンテンツを表示
+	serveRepositoryContent(c, repo, urlUsername, repoUUID, filePath)
+}
+
+// コンテンツを返す関数を分離して処理をシンプルに
+func serveRepositoryContent(c *gin.Context, repo models.Repository, urlUsername string, repoUUID string, filePath string) {
+	// ファイルコンテンツの取得を試みる
 	content, err := FileStorage.GetFile(repo.UUID, filePath)
 	if err == nil {
 		c.JSON(http.StatusOK, gin.H{
@@ -192,6 +218,7 @@ func FileViewerHandler(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "File or directory not found"})
 		return
 	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"username":    urlUsername,
 		"repo_uuid":   repoUUID,
