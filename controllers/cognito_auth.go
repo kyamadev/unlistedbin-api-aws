@@ -161,7 +161,13 @@ func (ctrl *CognitoAuthController) LoginHandler(c *gin.Context) {
 
 	authResult, err := ctrl.CognitoClient.Login(login.EmailOrUsername, login.Password)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Authentication failed"})
+		errMsg := "Authentication failed"
+		if strings.Contains(err.Error(), "NotAuthorizedException") {
+			errMsg = "ユーザー名/メールアドレスまたはパスワードが正しくありません"
+		} else if strings.Contains(err.Error(), "UserNotConfirmedException") {
+			errMsg = "アカウントが確認されていません。メールの確認コードを使用して確認してください"
+		}
+		c.JSON(http.StatusUnauthorized, gin.H{"error": errMsg, "details": err.Error()})
 		return
 	}
 

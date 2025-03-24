@@ -201,30 +201,24 @@ func (v *CognitoJWTValidator) ValidateToken(tokenString string) (*CognitoClaims,
 	return claims, nil
 }
 
-func (v *CognitoJWTValidator) ParseAndValidateToken(authHeader string) (*CognitoClaims, error) {
-	if authHeader == "" {
-		return nil, errors.New("authorization header is missing")
-	}
+func (v *CognitoJWTValidator) ParseAndValidateToken(authValue string) (*CognitoClaims, error) {
+	tokenString := authValue
+	tokenString = strings.TrimPrefix(tokenString, "Bearer ")
 
-	parts := strings.Split(authHeader, " ")
-	if len(parts) != 2 || parts[0] != "Bearer" {
-		return nil, errors.New("invalid authorization header format")
+	if tokenString == "" {
+		return nil, errors.New("token is empty")
 	}
-	tokenString := parts[1]
 
 	return v.ValidateToken(tokenString)
 }
 
-func (v *CognitoJWTValidator) VerifyTokenWithContext(ctx context.Context, authHeader string) (*CognitoClaims, error) {
-	if authHeader == "" {
-		return nil, errors.New("authorization header is missing")
-	}
+func (v *CognitoJWTValidator) VerifyTokenWithContext(ctx context.Context, authValue string) (*CognitoClaims, error) {
+	tokenString := authValue
+	tokenString = strings.TrimPrefix(tokenString, "Bearer ")
 
-	parts := strings.Split(authHeader, " ")
-	if len(parts) != 2 || parts[0] != "Bearer" {
-		return nil, errors.New("invalid authorization header format")
+	if tokenString == "" {
+		return nil, errors.New("token is empty")
 	}
-	tokenString := parts[1]
 
 	type result struct {
 		claims *CognitoClaims
@@ -273,7 +267,11 @@ func JWTAuthMiddleware(validator *CognitoJWTValidator) gin.HandlerFunc {
 		ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 		defer cancel()
 
-		claims, err := validator.VerifyTokenWithContext(ctx, tokenStr)
+		var claims *CognitoClaims
+		var err error
+
+		bearerToken := "Bearer " + tokenStr
+		claims, err = validator.VerifyTokenWithContext(ctx, bearerToken)
 		if err != nil {
 			c.JSON(http.StatusUnauthorized, gin.H{
 				"error":   "Invalid or expired token",

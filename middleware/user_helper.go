@@ -78,12 +78,62 @@ func GetUserFromContext(c *gin.Context, db *gorm.DB) (*models.User, error) {
 	}
 
 	var user models.User
-	if err := db.Where("cognito_id = ?", cognitoID).First(&user).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			// 自動ユーザー作成を試みる
-			return createUserFromContext(c, db, cognitoID)
+	result := db.Where("cognito_id = ?", cognitoID).First(&user)
+
+	if result.Error != nil {
+		// データベースに見つからない場合はコンテキストから情報を取得して自動作成
+		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+			emailVal, emailExists := c.Get("email")
+			usernameVal, usernameExists := c.Get("username")
+
+			var email, username string
+			if emailExists {
+				email, _ = emailVal.(string)
+			}
+
+			if usernameExists {
+				username, _ = usernameVal.(string)
+			}
+
+			if email == "" && username == "" {
+				return nil, fmt.Errorf("user with cognito ID %s not found and insufficient information to create", cognitoID)
+			}
+
+			// 不足情報の補完
+			if email == "" {
+				email = username
+			}
+
+			if username == "" {
+				parts := strings.Split(email, "@")
+				username = parts[0]
+
+				// 既存ユーザー名と衝突しないか確認
+				var count int64
+				db.Model(&models.User{}).Where("username = ?", username).Count(&count)
+				if count > 0 {
+					username = fmt.Sprintf("%s_%d", username, time.Now().Unix())
+				}
+			}
+
+			newUser := models.User{
+				Username:      username,
+				Email:         email,
+				CognitoID:     cognitoID,
+				EmailVerified: true,
+			}
+
+			if err := db.Create(&newUser).Error; err != nil {
+				return nil, fmt.Errorf("failed to create user record: %w", err)
+			}
+
+			log.Printf("Cognitoユーザー用のDBレコードを自動作成: ID=%s, ユーザー名=%s, メール=%s",
+				cognitoID, username, email)
+
+			return &newUser, nil
 		}
-		return nil, fmt.Errorf("database error: %w", err)
+
+		return nil, fmt.Errorf("database error: %w", result.Error)
 	}
 
 	return &user, nil

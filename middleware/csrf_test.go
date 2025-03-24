@@ -9,6 +9,9 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+// テスト用の十分な長さのCSRFトークン（32文字以上）
+const testCSRFToken = "test-csrf-token-with-sufficient-length-for-validation"
+
 func TestCSRFMiddleware_GET_Request(t *testing.T) {
 	// テスト用のGinエンジンをセットアップ
 	gin.SetMode(gin.TestMode)
@@ -66,12 +69,11 @@ func TestCSRFMiddleware_POST_ValidToken(t *testing.T) {
 	req, _ := http.NewRequest("POST", "/test", nil)
 
 	// CSRF保護のための準備（Cookieとヘッダーの両方が必要）
-	csrfToken := "test-csrf-token"
 	req.AddCookie(&http.Cookie{
 		Name:  CSRFTokenCookieName,
-		Value: csrfToken,
+		Value: testCSRFToken,
 	})
-	req.Header.Set(CSRFHeaderName, csrfToken)
+	req.Header.Set(CSRFHeaderName, testCSRFToken)
 
 	// リクエストを実行
 	router.ServeHTTP(w, req)
@@ -101,9 +103,9 @@ func TestCSRFMiddleware_POST_InvalidToken(t *testing.T) {
 	// 不一致のCSRFトークン
 	req.AddCookie(&http.Cookie{
 		Name:  CSRFTokenCookieName,
-		Value: "cookie-token",
+		Value: testCSRFToken + "1",
 	})
-	req.Header.Set(CSRFHeaderName, "header-token")
+	req.Header.Set(CSRFHeaderName, testCSRFToken+"2")
 
 	// リクエストを実行
 	router.ServeHTTP(w, req)
@@ -130,7 +132,7 @@ func TestCSRFMiddleware_POST_MissingCookie(t *testing.T) {
 	req, _ := http.NewRequest("POST", "/test", nil)
 
 	// ヘッダーのみ設定
-	req.Header.Set(CSRFHeaderName, "header-token")
+	req.Header.Set(CSRFHeaderName, testCSRFToken)
 
 	// リクエストを実行
 	router.ServeHTTP(w, req)
@@ -159,7 +161,7 @@ func TestCSRFMiddleware_POST_MissingHeader(t *testing.T) {
 	// Cookieのみ設定
 	req.AddCookie(&http.Cookie{
 		Name:  CSRFTokenCookieName,
-		Value: "cookie-token",
+		Value: testCSRFToken,
 	})
 
 	// リクエストを実行

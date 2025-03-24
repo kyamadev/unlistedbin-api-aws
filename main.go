@@ -96,7 +96,77 @@ func main() {
 	r.GET("/api/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "healthy"})
 	})
+	// CSRFデバッグエンドポイント
+	r.GET("/api/debug/csrf", func(c *gin.Context) {
+		csrfToken, err := c.Cookie(middleware.CSRFTokenCookieName)
+		tokenStatus := "not_found"
+		if err == nil {
+			tokenStatus = "found"
+		}
 
+		// 新しいCSRFトークンを生成
+		newToken, genErr := middleware.GenerateCSRFToken()
+		if genErr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate CSRF token"})
+			return
+		}
+
+		// クッキーを設定
+		domain := ""
+		secure := false
+		if os.Getenv("ENV") == "production" {
+			secure = true
+			domain = os.Getenv("COOKIE_DOMAIN")
+		}
+
+		sameSite := http.SameSiteLaxMode
+		if os.Getenv("ENV") == "production" {
+			sameSite = http.SameSiteStrictMode
+		}
+
+		c.SetSameSite(sameSite)
+		c.SetCookie(middleware.CSRFTokenCookieName, newToken, int((24 * time.Hour).Seconds()), "/", domain, secure, false)
+
+		c.JSON(http.StatusOK, gin.H{
+			"csrf_status": map[string]interface{}{
+				"previous_token_status": tokenStatus,
+				"previous_token": func() string {
+					if err == nil {
+						return csrfToken[:10] + "..."
+					}
+					return ""
+				}(),
+				"new_token":     newToken[:10] + "...",
+				"new_token_set": true,
+			},
+			"csrf_instructions": "このエンドポイントにアクセスすると新しいCSRFトークンが設定されます。",
+			"notes":             "非GETリクエストでは、このトークンをX-CSRF-Tokenヘッダーに含める必要があります",
+		})
+	})
+
+	// CSRFテストエンドポイント
+	r.POST("/api/debug/csrf-test", func(c *gin.Context) {
+		headerToken := c.GetHeader(middleware.CSRFHeaderName)
+		cookieToken, cookieErr := c.Cookie(middleware.CSRFTokenCookieName)
+
+		c.JSON(http.StatusOK, gin.H{
+			"csrf_test_result": map[string]interface{}{
+				"cookie_token_exists": cookieErr == nil,
+				"header_token_exists": headerToken != "",
+				"tokens_match":        cookieErr == nil && headerToken != "" && headerToken == cookieToken,
+				"validation_success":  cookieErr == nil && headerToken != "" && headerToken == cookieToken,
+			},
+			"headers": map[string]string{
+				"X-CSRF-Token": headerToken,
+			},
+			"cookie": func() string {
+				if cookieErr == nil {
+					return cookieToken[:10] + "..."
+				}
+				return "not found"
+			}(),
+		})
+	})
 	// 認証系エンドポイント
 	r.POST("/api/auth/register", cognitoAuthController.RegisterHandler)
 	r.POST("/api/auth/login", cognitoAuthController.LoginHandler)
