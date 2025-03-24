@@ -71,15 +71,24 @@ func main() {
 
 	r := gin.Default()
 	frontendURL := os.Getenv("FRONTEND_URL")
+	// セキュリティヘッダーミドルウェアを追加（XSS対策）
+	r.Use(middleware.SecurityHeadersMiddleware())
+
 	// CORS
 	r.Use(cors.New(cors.Config{
 		AllowOrigins:     []string{"http://localhost:3000", frontendURL},
 		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-		AllowHeaders:     []string{"Origin", "Authorization", "Content-Type"},
+		AllowHeaders:     []string{"Origin", "Authorization", "Content-Type", "X-CSRF-Token"},
 		ExposeHeaders:    []string{"Content-Length"},
 		AllowCredentials: true,
 		MaxAge:           12 * time.Hour,
 	}))
+
+	// CSRFミドルウェアを追加（モバイルアプリ対応）
+	r.Use(middleware.CSRFMiddleware())
+
+	// トークンリフレッシュミドルウェアを追加（必要に応じてリフレッシュ処理を行う）
+	r.Use(middleware.RefreshTokenMiddleware(cognitoClient.IdentityProviderClient, cognitoClient.UserPoolClientID))
 
 	cognitoAuthController := controllers.NewCognitoAuthController(cognitoClient, db)
 
@@ -87,14 +96,24 @@ func main() {
 	r.GET("/api/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "healthy"})
 	})
+
+	// 認証系エンドポイント
 	r.POST("/api/auth/register", cognitoAuthController.RegisterHandler)
 	r.POST("/api/auth/login", cognitoAuthController.LoginHandler)
 	r.GET("/api/auth/check-username", cognitoAuthController.CheckUsernameAvailability)
 	r.POST("/api/auth/logout", cognitoAuthController.LogoutHandler)
 
+	// 追加認証エンドポイント
+	r.POST("/api/auth/confirm-signup", cognitoAuthController.ConfirmSignUpHandler)
+	r.POST("/api/auth/reset-password", cognitoAuthController.ResetPasswordHandler)
+	r.POST("/api/auth/confirm-reset-password", cognitoAuthController.ConfirmResetPasswordHandler)
+
+	// 認証が必要なエンドポイント
 	authGroup := r.Group("/api")
 	authGroup.Use(middleware.JWTAuthMiddleware(jwtValidator))
 	{
+		authGroup.GET("/auth/me", cognitoAuthController.GetUserInfoHandler)
+		authGroup.PUT("/auth/change-password", cognitoAuthController.ChangePasswordHandler)
 		authGroup.GET("/repositories", controllers.GetRepositories)
 		authGroup.POST("/repositories", controllers.CreateRepository)
 		authGroup.DELETE("/repositories/:uuid", controllers.DeleteRepository)

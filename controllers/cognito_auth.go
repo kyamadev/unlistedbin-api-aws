@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -13,6 +14,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 
+	appConfig "Unlistedbin-api/config"
 	"Unlistedbin-api/middleware"
 	"Unlistedbin-api/models"
 )
@@ -126,14 +128,11 @@ func (ctrl *CognitoAuthController) RegisterHandler(c *gin.Context) {
 		return
 	}
 
-	// Register with Cognito
 	userSub, err := ctrl.CognitoClient.RegisterUser(registration.Email, registration.Password, registration.Username)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Registration failed", "details": err.Error()})
 		return
 	}
-
-	// Store user in our database
 	user := models.User{
 		Username:  registration.Username,
 		Email:     registration.Email,
@@ -152,6 +151,7 @@ func (ctrl *CognitoAuthController) LoginHandler(c *gin.Context) {
 	var login struct {
 		EmailOrUsername string `json:"emailOrUsername" binding:"required"`
 		Password        string `json:"password" binding:"required"`
+		ClientType      string `json:"clientType"` // "web" or "mobile"
 	}
 
 	if err := c.ShouldBindJSON(&login); err != nil {
@@ -159,52 +159,290 @@ func (ctrl *CognitoAuthController) LoginHandler(c *gin.Context) {
 		return
 	}
 
-	// Authenticate with Cognito
 	authResult, err := ctrl.CognitoClient.Login(login.EmailOrUsername, login.Password)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Authentication failed"})
 		return
 	}
 
-	// Return tokens to client
+	clientType := login.ClientType
+	if clientType == "" {
+		userAgent := c.GetHeader("User-Agent")
+		if strings.Contains(userAgent, "Mobile") ||
+			strings.Contains(userAgent, "Android") ||
+			strings.Contains(userAgent, "iOS") {
+			clientType = "mobile"
+		} else {
+			clientType = "web"
+		}
+	}
+
+	if clientType != "mobile" {
+		domain := ""
+		secure := false
+		if appConfig.AppConfig.Env == "production" {
+			secure = true
+			domain = appConfig.AppConfig.CookieDomain
+		}
+
+		// XSS対策
+		sameSite := http.SameSiteLaxMode
+		if appConfig.AppConfig.Env == "production" {
+			sameSite = http.SameSiteStrictMode
+		}
+
+		c.SetSameSite(sameSite)
+		c.SetCookie(
+			"id_token",
+			*authResult.AuthenticationResult.IdToken,
+			int(authResult.AuthenticationResult.ExpiresIn),
+			"/",
+			domain,
+			secure,
+			true, // HTTPOnly
+		)
+
+		c.SetSameSite(sameSite)
+		c.SetCookie(
+			"refresh_token",
+			*authResult.AuthenticationResult.RefreshToken,
+			60*60*24*30, // 30days
+			"/",
+			domain,
+			secure,
+			true, // HTTPOnly
+		)
+
+		c.JSON(http.StatusOK, gin.H{
+			"message": "Logged in successfully",
+			"status":  "success",
+		})
+		return
+	}
+
+	// モバイルクライアントの場合のみトークン情報を返す
+	expiresAt := time.Now().Add(time.Duration(authResult.AuthenticationResult.ExpiresIn) * time.Second)
+
 	c.JSON(http.StatusOK, gin.H{
 		"message":       "Logged in successfully",
 		"token":         authResult.AuthenticationResult.IdToken,
 		"refresh_token": authResult.AuthenticationResult.RefreshToken,
 		"expires_in":    authResult.AuthenticationResult.ExpiresIn,
+		"expires_at":    expiresAt.Format(time.RFC3339),
 	})
 }
 
 func (ctrl *CognitoAuthController) LogoutHandler(c *gin.Context) {
-	authHeader := c.GetHeader("Authorization")
-	if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Authentication token required"})
-		return
-	}
-
+	var refreshToken string
 	var logoutReq struct {
-		RefreshToken string `json:"refresh_token" binding:"required"`
+		RefreshToken string `json:"refresh_token"`
 	}
 
-	if err := c.ShouldBindJSON(&logoutReq); err != nil {
-		c.JSON(http.StatusOK, gin.H{"message": "Logged out successfully (token will expire naturally)"})
+	if err := c.ShouldBindJSON(&logoutReq); err == nil && logoutReq.RefreshToken != "" {
+		refreshToken = logoutReq.RefreshToken
+	} else {
+		cookieToken, err := c.Cookie("refresh_token")
+		if err == nil {
+			refreshToken = cookieToken
+		}
+	}
+
+	if refreshToken != "" {
+		_, err := ctrl.CognitoClient.IdentityProviderClient.RevokeToken(context.TODO(), &cognito.RevokeTokenInput{
+			ClientId: aws.String(ctrl.CognitoClient.UserPoolClientID),
+			Token:    aws.String(refreshToken),
+		})
+
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"warning": "Failed to revoke refresh token, but cookies have been cleared",
+				"details": err.Error(),
+			})
+		}
+	}
+
+	domain := ""
+	secure := false
+	if appConfig.AppConfig.Env == "production" {
+		secure = true
+		domain = appConfig.AppConfig.CookieDomain
+	}
+
+	sameSite := http.SameSiteLaxMode
+	if appConfig.AppConfig.Env == "production" {
+		sameSite = http.SameSiteStrictMode
+	}
+
+	c.SetSameSite(sameSite)
+	c.SetCookie("id_token", "", -1, "/", domain, secure, true)
+
+	c.SetSameSite(sameSite)
+	c.SetCookie("refresh_token", "", -1, "/", domain, secure, true)
+
+	c.SetSameSite(sameSite)
+	c.SetCookie("csrf_token", "", -1, "/", domain, secure, false)
+
+	c.JSON(http.StatusOK, gin.H{"message": "Logged out successfully"})
+}
+
+func (ctrl *CognitoAuthController) GetUserInfoHandler(c *gin.Context) {
+	user, err := middleware.GetUserFromContext(c, ctrl.DB)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Authentication failed", "details": err.Error()})
 		return
 	}
 
-	_, err := ctrl.CognitoClient.IdentityProviderClient.RevokeToken(context.TODO(), &cognito.RevokeTokenInput{
-		ClientId: aws.String(ctrl.CognitoClient.UserPoolClientID),
-		Token:    aws.String(logoutReq.RefreshToken),
+	c.JSON(http.StatusOK, gin.H{
+		"id":       user.ID,
+		"username": user.Username,
+		"email":    user.Email,
 	})
+}
 
+func (ctrl *CognitoAuthController) ConfirmSignUpHandler(c *gin.Context) {
+	var confirm struct {
+		Username         string `json:"username" binding:"required"`
+		ConfirmationCode string `json:"confirmationCode" binding:"required"`
+	}
+
+	if err := c.ShouldBindJSON(&confirm); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request"})
+		return
+	}
+
+	confirmSignUpInput := &cognito.ConfirmSignUpInput{
+		ClientId:         aws.String(ctrl.CognitoClient.UserPoolClientID),
+		Username:         aws.String(confirm.Username),
+		ConfirmationCode: aws.String(confirm.ConfirmationCode),
+	}
+
+	_, err := ctrl.CognitoClient.IdentityProviderClient.ConfirmSignUp(context.TODO(), confirmSignUpInput)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error":   "Failed to revoke refresh token",
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":   "Failed to confirm signup",
 			"details": err.Error(),
 		})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"message": "Logged out successfully"})
+	var user models.User
+	if err := ctrl.DB.Where("username = ? OR email = ?", confirm.Username, confirm.Username).First(&user).Error; err == nil {
+		user.EmailVerified = true
+		ctrl.DB.Save(&user)
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Signup confirmed successfully"})
+}
+
+func (ctrl *CognitoAuthController) ResetPasswordHandler(c *gin.Context) {
+	var reset struct {
+		Username string `json:"username" binding:"required"`
+	}
+
+	if err := c.ShouldBindJSON(&reset); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request"})
+		return
+	}
+
+	forgotPasswordInput := &cognito.ForgotPasswordInput{
+		ClientId: aws.String(ctrl.CognitoClient.UserPoolClientID),
+		Username: aws.String(reset.Username),
+	}
+
+	result, err := ctrl.CognitoClient.IdentityProviderClient.ForgotPassword(context.TODO(), forgotPasswordInput)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":   "Failed to request password reset",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	var destination string
+	if result.CodeDeliveryDetails != nil && result.CodeDeliveryDetails.Destination != nil {
+		destination = *result.CodeDeliveryDetails.Destination
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":     "Reset code sent successfully",
+		"destination": destination,
+	})
+}
+
+func (ctrl *CognitoAuthController) ConfirmResetPasswordHandler(c *gin.Context) {
+	var confirm struct {
+		Username         string `json:"username" binding:"required"`
+		ConfirmationCode string `json:"confirmationCode" binding:"required"`
+		NewPassword      string `json:"newPassword" binding:"required"`
+	}
+
+	if err := c.ShouldBindJSON(&confirm); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request"})
+		return
+	}
+
+	confirmForgotPasswordInput := &cognito.ConfirmForgotPasswordInput{
+		ClientId:         aws.String(ctrl.CognitoClient.UserPoolClientID),
+		Username:         aws.String(confirm.Username),
+		ConfirmationCode: aws.String(confirm.ConfirmationCode),
+		Password:         aws.String(confirm.NewPassword),
+	}
+
+	_, err := ctrl.CognitoClient.IdentityProviderClient.ConfirmForgotPassword(context.TODO(), confirmForgotPasswordInput)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":   "Failed to reset password",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Password reset successfully"})
+}
+
+func (ctrl *CognitoAuthController) ChangePasswordHandler(c *gin.Context) {
+	var change struct {
+		OldPassword string `json:"oldPassword" binding:"required"`
+		NewPassword string `json:"newPassword" binding:"required"`
+	}
+
+	if err := c.ShouldBindJSON(&change); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request"})
+		return
+	}
+
+	if _, err := middleware.GetUserFromContext(c, ctrl.DB); err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Authentication failed", "details": err.Error()})
+		return
+	}
+
+	idToken, cookieErr := c.Cookie("id_token")
+
+	if cookieErr != nil {
+		authHeader := c.GetHeader("Authorization")
+		if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Authentication token required"})
+			return
+		}
+		idToken = strings.TrimPrefix(authHeader, "Bearer ")
+	}
+
+	changePasswordInput := &cognito.ChangePasswordInput{
+		AccessToken:      aws.String(idToken),
+		PreviousPassword: aws.String(change.OldPassword),
+		ProposedPassword: aws.String(change.NewPassword),
+	}
+
+	_, err := ctrl.CognitoClient.IdentityProviderClient.ChangePassword(context.TODO(), changePasswordInput)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":   "Failed to change password",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Password changed successfully"})
 }
 
 func (ctrl *CognitoAuthController) CheckUsernameAvailability(c *gin.Context) {
@@ -340,6 +578,27 @@ func (ctrl *CognitoAuthController) DeleteAccountHandler(c *gin.Context) {
 		})
 		return
 	}
+
+	domain := ""
+	secure := false
+	if appConfig.AppConfig.Env == "production" {
+		secure = true
+		domain = appConfig.AppConfig.CookieDomain
+	}
+
+	sameSite := http.SameSiteLaxMode
+	if appConfig.AppConfig.Env == "production" {
+		sameSite = http.SameSiteStrictMode
+	}
+
+	c.SetSameSite(sameSite)
+	c.SetCookie("id_token", "", -1, "/", domain, secure, true)
+
+	c.SetSameSite(sameSite)
+	c.SetCookie("refresh_token", "", -1, "/", domain, secure, true)
+
+	c.SetSameSite(sameSite)
+	c.SetCookie("csrf_token", "", -1, "/", domain, secure, false)
 
 	c.JSON(http.StatusOK, gin.H{"message": "Account and all repositories deleted successfully"})
 }

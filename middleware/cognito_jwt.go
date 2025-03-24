@@ -9,10 +9,14 @@ import (
 	"fmt"
 	"math/big"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	cognito "github.com/aws/aws-sdk-go-v2/service/cognitoidentityprovider"
+	"github.com/aws/aws-sdk-go-v2/service/cognitoidentityprovider/types"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 )
@@ -243,12 +247,33 @@ func (v *CognitoJWTValidator) VerifyTokenWithContext(ctx context.Context, authHe
 
 func JWTAuthMiddleware(validator *CognitoJWTValidator) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		var tokenStr string
+		var tokenSource string
+
+		tokenCookie, cookieErr := c.Cookie("id_token")
+		if cookieErr == nil && tokenCookie != "" {
+			tokenStr = tokenCookie
+			tokenSource = "cookie"
+		}
+
 		authHeader := c.GetHeader("Authorization")
+		if tokenSource == "" && authHeader != "" && strings.HasPrefix(authHeader, "Bearer ") {
+			tokenStr = strings.TrimPrefix(authHeader, "Bearer ")
+			tokenSource = "header"
+		}
+		if tokenStr == "" {
+			c.JSON(http.StatusUnauthorized, gin.H{
+				"error":  "Authentication required",
+				"detail": "No valid authentication token found",
+			})
+			c.Abort()
+			return
+		}
 
 		ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 		defer cancel()
 
-		claims, err := validator.VerifyTokenWithContext(ctx, authHeader)
+		claims, err := validator.VerifyTokenWithContext(ctx, tokenStr)
 		if err != nil {
 			c.JSON(http.StatusUnauthorized, gin.H{
 				"error":   "Invalid or expired token",
@@ -262,6 +287,7 @@ func JWTAuthMiddleware(validator *CognitoJWTValidator) gin.HandlerFunc {
 		c.Set("userID", subject)
 		c.Set("username", claims.Username)
 		c.Set("email", claims.Email)
+		c.Set("tokenSource", tokenSource) // トークンのソースを記録（デバッグ用）
 
 		if len(claims.CognitoGroups) > 0 {
 			c.Set("userGroups", claims.CognitoGroups)
@@ -273,17 +299,29 @@ func JWTAuthMiddleware(validator *CognitoJWTValidator) gin.HandlerFunc {
 
 func OptionalJWTAuthMiddleware(validator *CognitoJWTValidator) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		var tokenStr string
+		var tokenSource string
+
+		tokenCookie, cookieErr := c.Cookie("id_token")
+		if cookieErr == nil && tokenCookie != "" {
+			tokenStr = tokenCookie
+			tokenSource = "cookie"
+		}
+
 		authHeader := c.GetHeader("Authorization")
-		if authHeader == "" {
+		if tokenSource == "" && authHeader != "" && strings.HasPrefix(authHeader, "Bearer ") {
+			tokenStr = strings.TrimPrefix(authHeader, "Bearer ")
+			tokenSource = "header"
+		}
+
+		if tokenStr == "" {
 			c.Next()
 			return
 		}
 
-		ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
-		defer cancel()
-
-		claims, err := validator.VerifyTokenWithContext(ctx, authHeader)
+		claims, err := validator.ValidateToken(tokenStr)
 		if err != nil {
+			// 無効なトークンでも続行
 			c.Next()
 			return
 		}
@@ -293,9 +331,86 @@ func OptionalJWTAuthMiddleware(validator *CognitoJWTValidator) gin.HandlerFunc {
 		c.Set("username", claims.Username)
 		c.Set("email", claims.Email)
 		c.Set("authenticated", true)
+		c.Set("tokenSource", tokenSource)
 
 		if len(claims.CognitoGroups) > 0 {
 			c.Set("userGroups", claims.CognitoGroups)
+		}
+
+		c.Next()
+	}
+}
+
+func RefreshTokenMiddleware(cognitoClient *cognito.Client, clientID string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+
+		idToken, err := c.Cookie("id_token")
+		if err != nil {
+			c.Next()
+			return
+		}
+
+		token, _, err := new(jwt.Parser).ParseUnverified(idToken, &CognitoClaims{})
+		if err != nil {
+			c.Next()
+			return
+		}
+
+		claims, ok := token.Claims.(*CognitoClaims)
+		if !ok {
+			c.Next()
+			return
+		}
+
+		expirationTime, err := claims.GetExpirationTime()
+		if err != nil || expirationTime == nil {
+			c.Next()
+			return
+		}
+
+		if time.Until(expirationTime.Time) < 15*time.Minute {
+			refreshToken, err := c.Cookie("refresh_token")
+			if err != nil || refreshToken == "" {
+				c.Next()
+				return
+			}
+
+			input := &cognito.InitiateAuthInput{
+				AuthFlow: types.AuthFlowTypeRefreshToken,
+				ClientId: aws.String(clientID),
+				AuthParameters: map[string]string{
+					"REFRESH_TOKEN": refreshToken,
+				},
+			}
+
+			result, err := cognitoClient.InitiateAuth(context.TODO(), input)
+			if err != nil {
+				c.Next()
+				return
+			}
+
+			domain := ""
+			secure := false
+			if os.Getenv("ENV") == "production" {
+				secure = true
+				domain = os.Getenv("COOKIE_DOMAIN")
+			}
+
+			sameSite := http.SameSiteLaxMode
+			if os.Getenv("ENV") == "production" {
+				sameSite = http.SameSiteStrictMode
+			}
+
+			c.SetSameSite(sameSite)
+			c.SetCookie(
+				"id_token",
+				*result.AuthenticationResult.IdToken,
+				int(result.AuthenticationResult.ExpiresIn),
+				"/",
+				domain,
+				secure,
+				true,
+			)
 		}
 
 		c.Next()

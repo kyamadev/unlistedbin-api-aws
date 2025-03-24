@@ -14,6 +14,7 @@ type Config struct {
 	CognitoClientID   string
 	S3Bucket          string
 	S3Region          string
+	CookieDomain      string
 }
 
 var AppConfig *Config
@@ -28,6 +29,7 @@ func LoadConfig() {
 	var storagePath string
 	var cognitoRegion, cognitoUserPoolID, cognitoClientID string
 	var s3Bucket, s3Region string
+	var cookieDomain string
 
 	if env == "production" {
 		dsn = os.Getenv("MYSQL_DSN")
@@ -39,6 +41,8 @@ func LoadConfig() {
 		if storagePath == "" {
 			panic("STORAGE_PATH environment variable is required in production")
 		}
+
+		cookieDomain = os.Getenv("COOKIE_DOMAIN")
 	} else {
 		dsn = os.Getenv("DB_DSN")
 		if dsn == "" {
@@ -49,6 +53,8 @@ func LoadConfig() {
 		if storagePath == "" {
 			storagePath = "./storage/local"
 		}
+
+		cookieDomain = os.Getenv("COOKIE_DOMAIN")
 	}
 
 	cognitoRegion = os.Getenv("COGNITO_REGION")
@@ -90,5 +96,6 @@ func LoadConfig() {
 		CognitoClientID:   cognitoClientID,
 		S3Bucket:          s3Bucket,
 		S3Region:          s3Region,
+		CookieDomain:      cookieDomain,
 	}
 }
