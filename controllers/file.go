@@ -160,6 +160,7 @@ func FileViewerHandler(c *gin.Context) {
 	}
 
 	if repo.Public {
+		c.Header("X-Robots-Tag", "noindex, nofollow")
 		serveRepositoryContent(c, repo, urlUsername, repoUUID, filePath)
 		return
 	}
