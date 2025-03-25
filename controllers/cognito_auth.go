@@ -693,12 +693,9 @@ func (ctrl *CognitoAuthController) ConfirmEmailHandler(c *gin.Context) {
 		return
 	}
 
-	// 確認成功後、実際にCognitoでメールアドレスを変更
-	// 注意: VerifyUserAttribute成功後は自動でCognitoのemailは変更されるが、
-	// AdminUpdateUserAttributesを使って元のユーザー名(email)も更新する必要がある
 	updateAttributesInput := &cognito.AdminUpdateUserAttributesInput{
 		UserPoolId: aws.String(ctrl.CognitoClient.UserPoolID),
-		Username:   aws.String(user.Email), // 古いメールアドレス(ユーザー名)
+		Username:   aws.String(user.CognitoID),
 		UserAttributes: []types.AttributeType{
 			{
 				Name:  aws.String("email"),
@@ -720,7 +717,7 @@ func (ctrl *CognitoAuthController) ConfirmEmailHandler(c *gin.Context) {
 		return
 	}
 
-	// データベースの更新 - 保留中のメールアドレスを正式なメールアドレスに変更
+	// データベースの更新
 	oldEmail := user.Email
 	user.Email = user.PendingEmail
 	user.PendingEmail = ""
