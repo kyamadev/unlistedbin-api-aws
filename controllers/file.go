@@ -206,6 +206,7 @@ func serveRepositoryContent(c *gin.Context, repo models.Repository, urlUsername 
 		c.JSON(http.StatusOK, gin.H{
 			"username":    urlUsername,
 			"repo_uuid":   repoUUID,
+			"repo_name":   repo.Name,
 			"filepath":    filePath,
 			"data":        string(content),
 			"isDirectory": false,
@@ -223,6 +224,7 @@ func serveRepositoryContent(c *gin.Context, repo models.Repository, urlUsername 
 	c.JSON(http.StatusOK, gin.H{
 		"username":    urlUsername,
 		"repo_uuid":   repoUUID,
+		"repo_name":   repo.Name,
 		"directory":   filePath,
 		"entries":     entries,
 		"isDirectory": true,
