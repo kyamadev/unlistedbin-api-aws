@@ -163,11 +163,11 @@ func (ctrl *CognitoAuthController) LoginHandler(c *gin.Context) {
 	if err != nil {
 		errMsg := "Authentication failed"
 		if strings.Contains(err.Error(), "NotAuthorizedException") {
-			errMsg = "メールアドレス/ユーザー名またはパスワードが正しくありません"
+			errMsg = "メールアドレスまたはパスワードが正しくありません"
 		} else if strings.Contains(err.Error(), "UserNotConfirmedException") {
 			errMsg = "アカウントが確認されていません。メールで送信された確認コードを使用して確認してください"
 		} else if strings.Contains(err.Error(), "UserNotFoundException") {
-			errMsg = "このメールアドレス/ユーザー名は登録されていません"
+			errMsg = "このメールアドレスは登録されていません"
 		} else if strings.Contains(err.Error(), "PasswordResetRequiredException") {
 			errMsg = "パスワードのリセットが必要です。パスワードリセット手続きを行ってください"
 		} else if strings.Contains(err.Error(), "TooManyRequestsException") {
