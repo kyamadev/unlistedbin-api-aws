@@ -229,6 +229,17 @@ func (ctrl *CognitoAuthController) LoginHandler(c *gin.Context) {
 			true, // HTTPOnly
 		)
 
+		c.SetSameSite(sameSite)
+		c.SetCookie(
+			"access_token",
+			*authResult.AuthenticationResult.AccessToken,
+			int(authResult.AuthenticationResult.ExpiresIn),
+			"/",
+			domain,
+			secure,
+			true, // HTTPOnly
+		)
+
 		c.JSON(http.StatusOK, gin.H{
 			"message": "Logged in successfully",
 			"status":  "success",
@@ -243,6 +254,7 @@ func (ctrl *CognitoAuthController) LoginHandler(c *gin.Context) {
 		"message":       "Logged in successfully",
 		"token":         authResult.AuthenticationResult.IdToken,
 		"refresh_token": authResult.AuthenticationResult.RefreshToken,
+		"access_token":  authResult.AuthenticationResult.AccessToken,
 		"expires_in":    authResult.AuthenticationResult.ExpiresIn,
 		"expires_at":    expiresAt.Format(time.RFC3339),
 	})
@@ -298,6 +310,9 @@ func (ctrl *CognitoAuthController) LogoutHandler(c *gin.Context) {
 	c.SetSameSite(sameSite)
 	c.SetCookie("csrf_token", "", -1, "/", domain, secure, false)
 
+	c.SetSameSite(sameSite)
+	c.SetCookie("access_token", "", -1, "/", domain, secure, true)
+
 	c.JSON(http.StatusOK, gin.H{"message": "Logged out successfully"})
 }
 
@@ -309,9 +324,11 @@ func (ctrl *CognitoAuthController) GetUserInfoHandler(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"id":       user.ID,
-		"username": user.Username,
-		"email":    user.Email,
+		"id":             user.ID,
+		"username":       user.Username,
+		"email":          user.Email,
+		"pending_email":  user.PendingEmail,
+		"email_verified": user.EmailVerified,
 	})
 }
 
@@ -539,6 +556,200 @@ func (ctrl *CognitoAuthController) UpdateUsernameHandler(c *gin.Context) {
 		"message":  "Username updated successfully",
 		"username": user.Username,
 	})
+}
+
+func (ctrl *CognitoAuthController) UpdateEmailHandler(c *gin.Context) {
+	user, err := middleware.GetUserFromContext(c, ctrl.DB)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Authentication failed", "details": err.Error()})
+		return
+	}
+
+	// Parse request
+	var payload struct {
+		NewEmail string `json:"newEmail" binding:"required,email"`
+	}
+
+	if err := c.ShouldBindJSON(&payload); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request: newEmail required and must be a valid email"})
+		return
+	}
+
+	// Check if new email is same as current
+	if user.Email == payload.NewEmail {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "New email is same as current email"})
+		return
+	}
+
+	// Check if email is available
+	var count int64
+	if err := ctrl.DB.Model(&models.User{}).Where("email = ?", payload.NewEmail).Count(&count).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
+		return
+	}
+
+	if count > 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Email already exists"})
+		return
+	}
+
+	// 保留中のメールアドレスとして新しいメールアドレスを保存
+	user.PendingEmail = payload.NewEmail
+	user.PendingEmailTimestamp = time.Now()
+	if err := ctrl.DB.Save(user).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update pending email in database"})
+		return
+	}
+
+	// CognitoのEmailAttributeにVerificationを送信
+	accessToken := getAccessToken(c)
+	if accessToken == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "アクセストークンが見つかりません。再度ログインしてください。",
+		})
+		return
+	}
+
+	updateAttributeInput := &cognito.UpdateUserAttributesInput{
+		AccessToken: aws.String(accessToken),
+		UserAttributes: []types.AttributeType{
+			{
+				Name:  aws.String("email"),
+				Value: aws.String(payload.NewEmail),
+			},
+		},
+	}
+
+	_, err = ctrl.CognitoClient.IdentityProviderClient.UpdateUserAttributes(context.TODO(), updateAttributeInput)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error":   "Failed to initiate email verification in Cognito",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":       "Email verification initiated. Please check your new email for verification code.",
+		"pending_email": user.PendingEmail,
+	})
+}
+
+func (ctrl *CognitoAuthController) ConfirmEmailHandler(c *gin.Context) {
+	user, err := middleware.GetUserFromContext(c, ctrl.DB)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Authentication failed", "details": err.Error()})
+		return
+	}
+
+	if user.PendingEmail == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "No pending email change found"})
+		return
+	}
+
+	if time.Since(user.PendingEmailTimestamp) > 24*time.Hour {
+		user.PendingEmail = ""
+		user.PendingEmailTimestamp = time.Time{}
+		ctrl.DB.Save(user)
+
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "確認コードの有効期限が切れています。メールアドレスの変更を再度開始してください。",
+			"code":  "EXPIRED_REQUEST",
+		})
+		return
+	}
+
+	// Parse request
+	var confirm struct {
+		ConfirmationCode string `json:"confirmationCode" binding:"required"`
+	}
+
+	if err := c.ShouldBindJSON(&confirm); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "確認コードを入力してください"})
+		return
+	}
+
+	accessToken := getAccessToken(c)
+	if accessToken == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "アクセストークンが見つかりません。再度ログインしてください。",
+		})
+		return
+	}
+
+	// Verify the confirmation code with Cognito
+	verifyAttributeInput := &cognito.VerifyUserAttributeInput{
+		AccessToken:   aws.String(accessToken),
+		AttributeName: aws.String("email"),
+		Code:          aws.String(confirm.ConfirmationCode),
+	}
+
+	_, err = ctrl.CognitoClient.IdentityProviderClient.VerifyUserAttribute(context.TODO(), verifyAttributeInput)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":   "確認コードの検証に失敗しました",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	// 確認成功後、実際にCognitoでメールアドレスを変更
+	// 注意: VerifyUserAttribute成功後は自動でCognitoのemailは変更されるが、
+	// AdminUpdateUserAttributesを使って元のユーザー名(email)も更新する必要がある
+	updateAttributesInput := &cognito.AdminUpdateUserAttributesInput{
+		UserPoolId: aws.String(ctrl.CognitoClient.UserPoolID),
+		Username:   aws.String(user.Email), // 古いメールアドレス(ユーザー名)
+		UserAttributes: []types.AttributeType{
+			{
+				Name:  aws.String("email"),
+				Value: aws.String(user.PendingEmail),
+			},
+			{
+				Name:  aws.String("email_verified"),
+				Value: aws.String("true"),
+			},
+		},
+	}
+
+	_, err = ctrl.CognitoClient.IdentityProviderClient.AdminUpdateUserAttributes(context.TODO(), updateAttributesInput)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error":   "Failed to update email in Cognito",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	// データベースの更新 - 保留中のメールアドレスを正式なメールアドレスに変更
+	oldEmail := user.Email
+	user.Email = user.PendingEmail
+	user.PendingEmail = ""
+	user.PendingEmailTimestamp = time.Time{}
+	user.EmailVerified = true
+	if err := ctrl.DB.Save(user).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update email in database"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":   "メールアドレスが正常に変更されました",
+		"old_email": oldEmail,
+		"new_email": user.Email,
+	})
+}
+
+func getAccessToken(c *gin.Context) string {
+	accessToken, cookieErr := c.Cookie("access_token")
+	if cookieErr == nil {
+		return accessToken
+	}
+
+	authHeader := c.GetHeader("Authorization")
+	if authHeader != "" && strings.HasPrefix(authHeader, "Bearer ") {
+		return strings.TrimPrefix(authHeader, "Bearer ")
+	}
+
+	return ""
 }
 
 func (ctrl *CognitoAuthController) DeleteAccountHandler(c *gin.Context) {

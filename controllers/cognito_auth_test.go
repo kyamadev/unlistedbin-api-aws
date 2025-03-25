@@ -41,9 +41,9 @@ func (m *MockCognitoWrapper) RegisterUser(email, password, username string) (str
 	return args.String(0), args.Error(1)
 }
 
-func (m *MockCognitoWrapper) Login(emailOrUsername, password string) (string, string, int32, error) {
+func (m *MockCognitoWrapper) Login(emailOrUsername, password string) (string, string, string, int32, error) {
 	args := m.Called(emailOrUsername, password)
-	return args.String(0), args.String(1), args.Get(2).(int32), args.Error(3)
+	return args.String(0), args.String(1), args.String(2), args.Get(3).(int32), args.Error(4)
 }
 
 // 認証コントローラーを単純化
@@ -99,7 +99,7 @@ func (ctrl *SimpleCognitoAuthController) RegisterHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Registration successful"})
 }
 
-// ログインハンドラー（簡易版）
+// ログインハンドラー（修正版）
 func (ctrl *SimpleCognitoAuthController) LoginHandler(c *gin.Context) {
 	var login struct {
 		EmailOrUsername string `json:"emailOrUsername" binding:"required"`
@@ -112,8 +112,8 @@ func (ctrl *SimpleCognitoAuthController) LoginHandler(c *gin.Context) {
 		return
 	}
 
-	// モックCognitoクライアントでログイン
-	idToken, refreshToken, expiresIn, err := ctrl.CognitoClient.Login(login.EmailOrUsername, login.Password)
+	// モックCognitoクライアントでログイン - アクセストークンも取得
+	idToken, refreshToken, accessToken, expiresIn, err := ctrl.CognitoClient.Login(login.EmailOrUsername, login.Password)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Authentication failed"})
 		return
@@ -142,6 +142,18 @@ func (ctrl *SimpleCognitoAuthController) LoginHandler(c *gin.Context) {
 		true,
 	)
 
+	// アクセストークンのクッキーも設定
+	c.SetSameSite(http.SameSiteLaxMode)
+	c.SetCookie(
+		"access_token",
+		accessToken,
+		int(expiresIn),
+		"/",
+		"",
+		false,
+		true,
+	)
+
 	// CSRFトークンも設定
 	c.SetSameSite(http.SameSiteLaxMode)
 	c.SetCookie(
@@ -159,6 +171,7 @@ func (ctrl *SimpleCognitoAuthController) LoginHandler(c *gin.Context) {
 		"message":       "Logged in successfully",
 		"token":         idToken,
 		"refresh_token": refreshToken,
+		"access_token":  accessToken,
 		"expires_in":    expiresIn,
 	})
 }
@@ -262,8 +275,9 @@ func TestLoginHandler_Success(t *testing.T) {
 	// モックの動作を定義
 	idToken := "test-id-token"
 	refreshToken := "test-refresh-token"
+	accessToken := "test-access-token" // アクセストークンを追加
 	expiresIn := int32(3600)
-	mockClient.On("Login", "testuser", "password123").Return(idToken, refreshToken, expiresIn, nil)
+	mockClient.On("Login", "testuser", "password123").Return(idToken, refreshToken, accessToken, expiresIn, nil)
 
 	// テスト用のコントローラーを作成
 	controller := &SimpleCognitoAuthController{
@@ -301,7 +315,7 @@ func TestLoginHandler_Success(t *testing.T) {
 
 	// Cookieが設定されていることを確認
 	cookies := w.Result().Cookies()
-	var idTokenCookie, refreshTokenCookie, csrfCookie *http.Cookie
+	var idTokenCookie, refreshTokenCookie, csrfCookie, accessTokenCookie *http.Cookie
 
 	for _, cookie := range cookies {
 		if cookie.Name == "id_token" {
@@ -310,6 +324,8 @@ func TestLoginHandler_Success(t *testing.T) {
 			refreshTokenCookie = cookie
 		} else if cookie.Name == "csrf_token" {
 			csrfCookie = cookie
+		} else if cookie.Name == "access_token" {
+			accessTokenCookie = cookie
 		}
 	}
 
@@ -320,6 +336,10 @@ func TestLoginHandler_Success(t *testing.T) {
 	assert.NotNil(t, refreshTokenCookie)
 	assert.Equal(t, "test-refresh-token", refreshTokenCookie.Value)
 	assert.True(t, refreshTokenCookie.HttpOnly)
+
+	assert.NotNil(t, accessTokenCookie)
+	assert.Equal(t, "test-access-token", accessTokenCookie.Value)
+	assert.True(t, accessTokenCookie.HttpOnly)
 
 	assert.NotNil(t, csrfCookie)
 	assert.Equal(t, "test-csrf-token", csrfCookie.Value)
@@ -337,7 +357,7 @@ func TestLoginHandler_InvalidCredentials(t *testing.T) {
 	mockClient := new(MockCognitoWrapper)
 
 	// モックの動作を定義 - エラーを返す
-	mockClient.On("Login", "testuser", "wrongpassword").Return("", "", int32(0), assert.AnError)
+	mockClient.On("Login", "testuser", "wrongpassword").Return("", "", "", int32(0), assert.AnError)
 
 	// テスト用のコントローラーを作成
 	controller := &SimpleCognitoAuthController{
@@ -375,4 +395,108 @@ func TestLoginHandler_InvalidCredentials(t *testing.T) {
 
 	// モックが呼び出されたことを確認
 	mockClient.AssertCalled(t, "Login", "testuser", "wrongpassword")
+}
+
+// ConfirmEmailHandlerのテストを追加
+func TestConfirmEmailHandler(t *testing.T) {
+	// テスト用のDBを準備
+	db := setupTestDB(t)
+
+	// テストユーザーを作成
+	testUser := &models.User{
+		Username:      "testuser",
+		Email:         "test@example.com",
+		CognitoID:     "test-cognito-id",
+		EmailVerified: false,
+	}
+	db.Create(testUser)
+
+	// テスト用のモックCognitoクライアント
+	mockIdentityProvider := &struct {
+		VerifyUserAttributeCalled bool
+		VerifyUserAttributeCode   string
+		VerifyUserAttributeToken  string
+	}{}
+
+	// テスト用のハンドラー
+	confirmHandler := func(c *gin.Context) {
+		// 認証済みユーザーの情報をセット
+		c.Set("userID", testUser.CognitoID)
+		c.Set("username", testUser.Username)
+		c.Set("email", testUser.Email)
+
+		// リクエストを解析
+		var confirm struct {
+			ConfirmationCode string `json:"confirmationCode"`
+		}
+		if err := c.ShouldBindJSON(&confirm); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "確認コードを入力してください"})
+			return
+		}
+
+		// アクセストークンを取得
+		accessToken, _ := c.Cookie("access_token")
+		if accessToken == "" {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": "アクセストークンが見つかりません",
+			})
+			return
+		}
+
+		// モックの記録
+		mockIdentityProvider.VerifyUserAttributeCalled = true
+		mockIdentityProvider.VerifyUserAttributeCode = confirm.ConfirmationCode
+		mockIdentityProvider.VerifyUserAttributeToken = accessToken
+
+		// DBを更新
+		db.Model(&models.User{}).Where("cognito_id = ?", testUser.CognitoID).Update("email_verified", true)
+
+		c.JSON(http.StatusOK, gin.H{
+			"message": "メールアドレスが正常に確認されました",
+			"email":   testUser.Email,
+		})
+	}
+
+	// テスト用のGinルーターを設定
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/confirm-email", confirmHandler)
+
+	// テストリクエストを作成
+	requestBody := map[string]string{
+		"confirmationCode": "123456",
+	}
+	jsonBody, _ := json.Marshal(requestBody)
+	req, _ := http.NewRequest("POST", "/confirm-email", bytes.NewBuffer(jsonBody))
+	req.Header.Set("Content-Type", "application/json")
+
+	// アクセストークンをCookieに追加
+	req.AddCookie(&http.Cookie{
+		Name:  "access_token",
+		Value: "test-access-token",
+	})
+
+	// レスポンスレコーダーを作成
+	w := httptest.NewRecorder()
+
+	// リクエストを実行
+	router.ServeHTTP(w, req)
+
+	// レスポンスをチェック
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	// レスポンスボディを解析
+	var response map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &response)
+	assert.Equal(t, "メールアドレスが正常に確認されました", response["message"])
+
+	// モックの呼び出し確認
+	assert.True(t, mockIdentityProvider.VerifyUserAttributeCalled)
+	assert.Equal(t, "123456", mockIdentityProvider.VerifyUserAttributeCode)
+	assert.Equal(t, "test-access-token", mockIdentityProvider.VerifyUserAttributeToken)
+
+	// データベースのユーザー情報が更新されたことを確認
+	var updatedUser models.User
+	db.Where("cognito_id = ?", testUser.CognitoID).First(&updatedUser)
+	assert.True(t, updatedUser.EmailVerified)
 }

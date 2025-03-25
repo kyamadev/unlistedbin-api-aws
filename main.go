@@ -190,6 +190,8 @@ func main() {
 		authGroup.PUT("/repositories/:uuid/visibility", controllers.UpdateVisibility)
 		authGroup.POST("/files/upload", controllers.UploadFileHandler)
 		authGroup.PUT("/auth/update-username", cognitoAuthController.UpdateUsernameHandler)
+		authGroup.PUT("/auth/update-email", cognitoAuthController.UpdateEmailHandler)
+		authGroup.POST("/auth/confirm-email", cognitoAuthController.ConfirmEmailHandler)
 		authGroup.DELETE("/auth/delete-account", cognitoAuthController.DeleteAccountHandler)
 	}
 
