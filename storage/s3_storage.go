@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
@@ -19,12 +21,35 @@ type S3Storage struct {
 }
 
 func NewS3Storage(region, bucket string) (*S3Storage, error) {
-	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(region))
-	if err != nil {
-		return nil, err
+	endpoint := os.Getenv("R2_ENDPOINT") // ex: https://xxxxxxxxxxxx.r2.cloudflarestorage.com
+	accessKey := os.Getenv("R2_ACCESS_KEY_ID")
+	secretKey := os.Getenv("R2_SECRET_ACCESS_KEY")
+
+	// 環境変数が設定されていない場合は標準のAWS設定を使用
+	if endpoint == "" || accessKey == "" || secretKey == "" {
+		// 通常のAWS S3設定
+		cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(region))
+		if err != nil {
+			return nil, err
+		}
+
+		client := s3.NewFromConfig(cfg)
+		return &S3Storage{
+			client: client,
+			bucket: bucket,
+			region: region,
+		}, nil
 	}
 
-	client := s3.NewFromConfig(cfg)
+	// R2用の設定
+	credProvider := credentials.NewStaticCredentialsProvider(accessKey, secretKey, "")
+
+	client := s3.New(s3.Options{
+		Region:       region,
+		Credentials:  aws.NewCredentialsCache(credProvider),
+		BaseEndpoint: aws.String(endpoint),
+		UsePathStyle: true,
+	})
 
 	return &S3Storage{
 		client: client,
@@ -43,7 +68,7 @@ func (s *S3Storage) SaveFile(repoUUID, fileName string, fileData io.Reader) (str
 
 	key = strings.ReplaceAll(key, "\\", "/")
 
-	// Upload to S3
+	// Upload to S3/R2
 	_, err = s.client.PutObject(context.TODO(), &s3.PutObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(key),
