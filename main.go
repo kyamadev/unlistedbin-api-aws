@@ -126,6 +126,14 @@ func setupRouter(cognitoAuthController *controllers.CognitoAuthController, jwtVa
 	r := gin.Default()
 	frontendURL := os.Getenv("FRONTEND_URL")
 
+	//Proxy設定
+	if os.Getenv("AWS_LAMBDA_FUNCTION_NAME") != "" {
+		// Lambda環境ではAPI Gatewayを信頼
+		r.SetTrustedProxies([]string{"0.0.0.0/0"})
+	} else {
+		// ローカル開発環境ではループバックのみ信頼
+		r.SetTrustedProxies([]string{"127.0.0.1"})
+	}
 	// セキュリティヘッダーミドルウェアを追加（XSS対策）
 	r.Use(middleware.SecurityHeadersMiddleware())
 
