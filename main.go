@@ -1,11 +1,15 @@
 package main
 
 import (
+	"context"
 	"log"
 	"net/http"
 	"os"
 	"time"
 
+	"github.com/aws/aws-lambda-go/events"
+	"github.com/aws/aws-lambda-go/lambda"
+	ginadapter "github.com/awslabs/aws-lambda-go-api-proxy/gin"
 	"github.com/joho/godotenv"
 
 	"github.com/gin-contrib/cors"
@@ -21,10 +25,15 @@ import (
 	"Unlistedbin-api/storage"
 )
 
-func main() {
-	if err := godotenv.Load(); err != nil {
-		log.Println("No .env file found, using environment variables")
+var ginLambda *ginadapter.GinLambda
+
+func init() {
+	if os.Getenv("AWS_LAMBDA_FUNCTION_NAME") == "" {
+		if err := godotenv.Load(); err != nil {
+			log.Println("No .env file found, using environment variables")
+		}
 	}
+
 	config.LoadConfig()
 
 	var db *gorm.DB
@@ -39,14 +48,17 @@ func main() {
 	}
 
 	db.AutoMigrate(&models.User{}, &models.Repository{}, &models.File{})
-
 	controllers.DB = db
 
 	var fileStorage storage.Storage
 	if config.AppConfig.Env == "production" {
-		s3Storage, err := storage.NewS3Storage(config.AppConfig.S3Region, config.AppConfig.S3Bucket)
+		// Cloudflare R2
+		r2Region := os.Getenv("R2_REGION")
+		r2Bucket := os.Getenv("R2_BUCKET")
+
+		s3Storage, err := storage.NewS3Storage(r2Region, r2Bucket)
 		if err != nil {
-			log.Fatalf("failed to initialize S3 storage: %v", err)
+			log.Fatalf("failed to initialize R2 storage: %v", err)
 		}
 		fileStorage = s3Storage
 	} else {
@@ -69,33 +81,85 @@ func main() {
 		config.AppConfig.CognitoClientID,
 	)
 
+	cognitoAuthController := controllers.NewCognitoAuthController(cognitoClient, controllers.DB)
+
+	r := setupRouter(cognitoAuthController, jwtValidator)
+
+	ginLambda = ginadapter.New(r)
+}
+
+func Handler(ctx context.Context, req events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
+	// API Gateway プロキシリクエストを処理してレスポンスを返す
+	return ginLambda.ProxyWithContext(ctx, req)
+}
+
+func main() {
+	// ローカル開発環境の場合、通常のGinサーバーを起動
+	if os.Getenv("AWS_LAMBDA_FUNCTION_NAME") == "" {
+		cognitoClient, err := controllers.NewCognitoClient(
+			config.AppConfig.CognitoRegion,
+			config.AppConfig.CognitoUserPoolID,
+			config.AppConfig.CognitoClientID,
+		)
+		if err != nil {
+			log.Fatalf("failed to initialize Cognito client: %v", err)
+		}
+
+		jwtValidator := middleware.NewCognitoJWTValidator(
+			config.AppConfig.CognitoRegion,
+			config.AppConfig.CognitoUserPoolID,
+			config.AppConfig.CognitoClientID,
+		)
+
+		cognitoAuthController := controllers.NewCognitoAuthController(cognitoClient, controllers.DB)
+
+		r := setupRouter(cognitoAuthController, jwtValidator)
+		r.Run(":8080")
+		return
+	}
+
+	// Lambda環境では、Lambda関数としてスタート
+	lambda.Start(Handler)
+}
+
+func setupRouter(cognitoAuthController *controllers.CognitoAuthController, jwtValidator *middleware.CognitoJWTValidator) *gin.Engine {
 	r := gin.Default()
 	frontendURL := os.Getenv("FRONTEND_URL")
+
 	// セキュリティヘッダーミドルウェアを追加（XSS対策）
 	r.Use(middleware.SecurityHeadersMiddleware())
 
-	// CORS
-	r.Use(cors.New(cors.Config{
-		AllowOrigins:     []string{"http://localhost:3000", frontendURL},
+	// CORS設定
+	corsConfig := cors.Config{
 		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
 		AllowHeaders:     []string{"Origin", "Authorization", "Content-Type", "X-CSRF-Token"},
 		ExposeHeaders:    []string{"Content-Length"},
 		AllowCredentials: true,
 		MaxAge:           12 * time.Hour,
-	}))
+	}
 
-	// CSRFミドルウェアを追加（モバイルアプリ対応）
+	// 本番環境では許可するオリジンを制限
+	if frontendURL != "" {
+		corsConfig.AllowOrigins = []string{frontendURL}
+	} else {
+		corsConfig.AllowOrigins = []string{"http://localhost:3000", "https://*.vercel.app"}
+	}
+
+	r.Use(cors.New(corsConfig))
+
 	r.Use(middleware.CSRFMiddleware())
 
-	// トークンリフレッシュミドルウェアを追加（必要に応じてリフレッシュ処理を行う）
-	r.Use(middleware.RefreshTokenMiddleware(cognitoClient.IdentityProviderClient, cognitoClient.UserPoolClientID))
+	if cognitoAuthController != nil && cognitoAuthController.CognitoClient != nil {
+		r.Use(middleware.RefreshTokenMiddleware(
+			cognitoAuthController.CognitoClient.IdentityProviderClient,
+			cognitoAuthController.CognitoClient.UserPoolClientID,
+		))
+	}
 
-	cognitoAuthController := controllers.NewCognitoAuthController(cognitoClient, db)
-
-	// Health check endpoint
 	r.GET("/api/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "healthy"})
 	})
+
 	// CSRFデバッグエンドポイント
 	r.GET("/api/debug/csrf", func(c *gin.Context) {
 		csrfToken, err := c.Cookie(middleware.CSRFTokenCookieName)
@@ -167,6 +231,7 @@ func main() {
 			}(),
 		})
 	})
+
 	// 認証系エンドポイント
 	r.POST("/api/auth/register", cognitoAuthController.RegisterHandler)
 	r.POST("/api/auth/login", cognitoAuthController.LoginHandler)
@@ -197,5 +262,5 @@ func main() {
 
 	r.GET("/api/:username/:uuid/*filepath", middleware.OptionalJWTAuthMiddleware(jwtValidator), controllers.FileViewerHandler)
 
-	r.Run(":8080")
+	return r
 }
