@@ -8,4 +8,5 @@ type File struct {
 	RepositoryID uint
 	FileName     string
 	FilePath     string
+	FileSize     int64 `json:"file_size"` //byte
 }

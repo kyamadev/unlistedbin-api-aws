@@ -98,6 +98,28 @@ func DeleteRepository(c *gin.Context) {
 		return
 	}
 
+	// リポジトリに含まれるファイルの合計サイズを計算
+	var files []models.File
+	var totalSize int64
+	if err := DB.Where("repository_id = ?", repo.ID).Find(&files).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve files"})
+		return
+	}
+
+	for _, file := range files {
+		totalSize += file.FileSize
+	}
+
+	// ユーザーの使用容量を更新
+	var user models.User
+	if err := DB.First(&user, repo.OwnerID).Error; err == nil {
+		user.StorageUsed -= totalSize
+		if user.StorageUsed < 0 {
+			user.StorageUsed = 0 // 負の値にならないように
+		}
+		DB.Save(&user)
+	}
+
 	if err := DB.Delete(&repo).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Deletion failed"})
 		return

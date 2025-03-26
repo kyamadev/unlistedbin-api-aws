@@ -323,12 +323,20 @@ func (ctrl *CognitoAuthController) GetUserInfoHandler(c *gin.Context) {
 		return
 	}
 
+	if user.StorageLimit == 0 {
+		user.StorageLimit = models.DefaultStorageLimit
+		ctrl.DB.Save(user)
+	}
+
 	c.JSON(http.StatusOK, gin.H{
-		"id":             user.ID,
-		"username":       user.Username,
-		"email":          user.Email,
-		"pending_email":  user.PendingEmail,
-		"email_verified": user.EmailVerified,
+		"id":              user.ID,
+		"username":        user.Username,
+		"email":           user.Email,
+		"pending_email":   user.PendingEmail,
+		"email_verified":  user.EmailVerified,
+		"storage_used":    user.StorageUsed,
+		"storage_limit":   user.StorageLimit,
+		"storage_percent": float64(user.StorageUsed) / float64(user.StorageLimit) * 100.0,
 	})
 }
 
