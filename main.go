@@ -43,13 +43,16 @@ func init() {
 	if config.AppConfig.Env == "production" {
 		dbUrl := config.AppConfig.DBDSN
 		// URLをチェックしてPostgreSQLかMySQLかを判定
-		if strings.HasPrefix(dbUrl, "postgres://") {
+		if strings.HasPrefix(dbUrl, "postgresql://") {
 			db, err = gorm.Open(postgres.Open(dbUrl), &gorm.Config{})
 		} else {
 			db, err = gorm.Open(mysql.Open(dbUrl), &gorm.Config{})
 		}
 	} else {
 		db, err = gorm.Open(sqlite.Open(config.AppConfig.DBDSN), &gorm.Config{})
+	}
+	if err != nil {
+		log.Fatalf("failed to connect to database: %v", err)
 	}
 
 	db.AutoMigrate(&models.User{}, &models.Repository{}, &models.File{})
