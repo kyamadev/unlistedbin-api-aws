@@ -1,0 +1,1 @@
+# [Unlistedbin](https://github.com/kyamadev/unlistedbin)用Go製API Server
