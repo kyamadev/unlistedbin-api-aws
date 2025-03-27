@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-lambda-go/events"
@@ -15,6 +16,7 @@ import (
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"gorm.io/driver/mysql"
+	"gorm.io/driver/postgres"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 
@@ -39,12 +41,15 @@ func init() {
 	var db *gorm.DB
 	var err error
 	if config.AppConfig.Env == "production" {
-		db, err = gorm.Open(mysql.Open(config.AppConfig.DBDSN), &gorm.Config{})
+		dbUrl := config.AppConfig.DBDSN
+		// URLをチェックしてPostgreSQLかMySQLかを判定
+		if strings.HasPrefix(dbUrl, "postgres://") {
+			db, err = gorm.Open(postgres.Open(dbUrl), &gorm.Config{})
+		} else {
+			db, err = gorm.Open(mysql.Open(dbUrl), &gorm.Config{})
+		}
 	} else {
 		db, err = gorm.Open(sqlite.Open(config.AppConfig.DBDSN), &gorm.Config{})
-	}
-	if err != nil {
-		log.Fatalf("failed to connect database: %v", err)
 	}
 
 	db.AutoMigrate(&models.User{}, &models.Repository{}, &models.File{})
@@ -113,8 +118,13 @@ func main() {
 
 		cognitoAuthController := controllers.NewCognitoAuthController(cognitoClient, controllers.DB)
 
+		port := os.Getenv("PORT")
+		if port == "" {
+			port = "8080"
+		}
+
 		r := setupRouter(cognitoAuthController, jwtValidator)
-		r.Run(":8080")
+		r.Run(":" + port)
 		return
 	}
 

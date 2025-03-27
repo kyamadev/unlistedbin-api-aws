@@ -34,7 +34,11 @@ func LoadConfig() {
 	if env == "production" {
 		dsn = os.Getenv("MYSQL_DSN")
 		if dsn == "" {
-			panic("MYSQL_DSN environment variable is required in production")
+			// PostgreSQL DSNをチェック
+			dsn = os.Getenv("DATABASE_URL") // Renderではこの環境変数
+			if dsn == "" {
+				panic("DATABASE_URL environment variable is required in production")
+			}
 		}
 
 		storagePath = os.Getenv("STORAGE_PATH")
