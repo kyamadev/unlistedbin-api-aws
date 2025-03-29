@@ -1,0 +1,57 @@
+name: Go Tests
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master, develop ]
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+    
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.24'
+        check-latest: true
+    
+    - name: Install dependencies
+      run: go mod download
+    
+    - name: Create required environment file
+      run: |
+        cat << EOF > .env.test
+        ENV=test
+        DB_DSN=test.db
+        STORAGE_PATH=./storage/test
+        COGNITO_REGION=us-east-1
+        COGNITO_USER_POOL_ID=test-user-pool-id
+        COGNITO_CLIENT_ID=test-client-id
+        S3_REGION=us-east-1
+        S3_BUCKET=test-bucket
+        FRONTEND_URL=http://localhost:3000
+        COOKIE_DOMAIN=localhost
+        EOF
+    
+    - name: Create test storage directory
+      run: mkdir -p ./storage/test
+    
+    - name: Run unit tests
+      run: go test -v -race ./controllers/... ./middleware/... ./models/... ./storage/...
+    
+    - name: Run integration tests
+      run: go test -v -race ./test/...
+    - name: Run tests with coverage
+      run: go test -v -race -coverprofile=coverage.txt -covermode=atomic ./...
+    
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./coverage.txt
+        fail_ci_if_error: true
