@@ -248,26 +248,41 @@ func ZipDownloadHandler(c *gin.Context) {
 		return
 	}
 
-	// 公開かつダウンロード許可があれば、認証関係なくダウンロード可能
+	// 公開かつダウンロード許可があれば、誰でもダウンロード可能
 	if repo.Public && repo.DownloadAllowed {
-		// 認証チェックをスキップして直接ダウンロード処理へ
 		log.Printf("公開リポジトリでダウンロード許可あり: %s", repoUUID)
-	} else if !repo.DownloadAllowed {
-		// ダウンロード許可がない場合は所有者のみダウンロード可能
-		isOwner, err := middleware.OwnershipCheck(c, DB, repo.OwnerID)
-		if err != nil || !isOwner {
-			c.JSON(http.StatusForbidden, gin.H{"error": "ダウンロードが許可されていません"})
-			return
-		}
-		log.Printf("オーナーによるダウンロード: %s", repoUUID)
-	} else if !repo.Public {
-		// 非公開リポジトリの場合、認証チェック
-		authenticatedVal, authenticated := c.Get("authenticated")
-		if !authenticated || authenticatedVal != true {
+	} else {
+		// それ以外の場合は認証が必要で、オーナーのみがダウンロード可能
+
+		// 認証済みかどうかをチェック（authenticated フラグが true かどうか）
+		authenticated, authExists := c.Get("authenticated")
+		if !authExists || authenticated != true {
 			c.JSON(http.StatusForbidden, gin.H{"error": "認証が必要です"})
 			return
 		}
-		log.Printf("認証ユーザーによる非公開リポジトリダウンロード: %s", repoUUID)
+
+		// ユーザーIDを取得
+		userIDVal, exists := c.Get("userID")
+		if !exists {
+			c.JSON(http.StatusForbidden, gin.H{"error": "ユーザー情報が取得できません"})
+			return
+		}
+
+		// リポジトリのオーナー情報を取得（ユーザー名とID）
+		var owner models.User
+		if err := DB.Where("id = ?", repo.OwnerID).First(&owner).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "ユーザー情報の取得に失敗しました"})
+			return
+		}
+
+		// ユーザーIDとオーナーの照合
+		if userIDVal.(string) != owner.CognitoID {
+			// オーナーでないのでアクセス拒否
+			c.JSON(http.StatusForbidden, gin.H{"error": "ダウンロードが許可されていません"})
+			return
+		}
+
+		log.Printf("オーナーによるダウンロード: %s", repoUUID)
 	}
 
 	// ZIP作成のための一時ファイル
