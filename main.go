@@ -279,9 +279,11 @@ func setupRouter(cognitoAuthController *controllers.CognitoAuthController, jwtVa
 		authGroup.PUT("/auth/update-email", cognitoAuthController.UpdateEmailHandler)
 		authGroup.POST("/auth/confirm-email", cognitoAuthController.ConfirmEmailHandler)
 		authGroup.DELETE("/auth/delete-account", cognitoAuthController.DeleteAccountHandler)
+		authGroup.PUT("/repositories/:uuid/download-permission", controllers.UpdateDownloadPermission)
 	}
 
 	r.GET("/api/:username/:uuid/*filepath", middleware.OptionalJWTAuthMiddleware(jwtValidator), controllers.FileViewerHandler)
+	r.GET("/api/:username/zip/:uuid", middleware.OptionalJWTAuthMiddleware(jwtValidator), controllers.ZipDownloadHandler)
 
 	return r
 }
