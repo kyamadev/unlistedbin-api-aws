@@ -208,12 +208,13 @@ func serveRepositoryContent(c *gin.Context, repo models.Repository, urlUsername 
 	content, err := FileStorage.GetFile(repo.UUID, filePath)
 	if err == nil {
 		c.JSON(http.StatusOK, gin.H{
-			"username":    urlUsername,
-			"repo_uuid":   repoUUID,
-			"repo_name":   repo.Name,
-			"filepath":    filePath,
-			"data":        string(content),
-			"isDirectory": false,
+			"username":         urlUsername,
+			"repo_uuid":        repoUUID,
+			"repo_name":        repo.Name,
+			"filepath":         filePath,
+			"data":             string(content),
+			"isDirectory":      false,
+			"download_allowed": repo.DownloadAllowed,
 		})
 		return
 	}
@@ -226,12 +227,13 @@ func serveRepositoryContent(c *gin.Context, repo models.Repository, urlUsername 
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"username":    urlUsername,
-		"repo_uuid":   repoUUID,
-		"repo_name":   repo.Name,
-		"directory":   filePath,
-		"entries":     entries,
-		"isDirectory": true,
+		"username":         urlUsername,
+		"repo_uuid":        repoUUID,
+		"repo_name":        repo.Name,
+		"directory":        filePath,
+		"entries":          entries,
+		"isDirectory":      true,
+		"download_allowed": repo.DownloadAllowed,
 	})
 }
 
@@ -246,29 +248,32 @@ func ZipDownloadHandler(c *gin.Context) {
 		return
 	}
 
-	// ダウンロード許可チェック
-	if !repo.DownloadAllowed {
+	// 公開かつダウンロード許可があれば、認証関係なくダウンロード可能
+	if repo.Public && repo.DownloadAllowed {
+		// 認証チェックをスキップして直接ダウンロード処理へ
+		log.Printf("公開リポジトリでダウンロード許可あり: %s", repoUUID)
+	} else if !repo.DownloadAllowed {
 		// ダウンロード許可がない場合は所有者のみダウンロード可能
 		isOwner, err := middleware.OwnershipCheck(c, DB, repo.OwnerID)
 		if err != nil || !isOwner {
 			c.JSON(http.StatusForbidden, gin.H{"error": "ダウンロードが許可されていません"})
 			return
 		}
-	}
-
-	// 表示アクセス権のチェック
-	if !repo.Public {
+		log.Printf("オーナーによるダウンロード: %s", repoUUID)
+	} else if !repo.Public {
 		// 非公開リポジトリの場合、認証チェック
 		authenticatedVal, authenticated := c.Get("authenticated")
 		if !authenticated || authenticatedVal != true {
 			c.JSON(http.StatusForbidden, gin.H{"error": "認証が必要です"})
 			return
 		}
+		log.Printf("認証ユーザーによる非公開リポジトリダウンロード: %s", repoUUID)
 	}
 
 	// ZIP作成のための一時ファイル
 	tempFile, err := os.CreateTemp("", "download-*.zip")
 	if err != nil {
+		log.Printf("一時ファイル作成エラー: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "ZIPファイルの作成に失敗しました"})
 		return
 	}
@@ -280,14 +285,44 @@ func ZipDownloadHandler(c *gin.Context) {
 	// リポジトリ全体のファイルを追加
 	err = addFilesToZip(zipWriter, FileStorage, repo.UUID, "", "")
 	if err != nil {
+		log.Printf("リポジトリ %s のファイルをZIPに追加中にエラー: %v", repo.UUID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "ZIPファイルの作成に失敗しました"})
 		return
 	}
-
-	zipWriter.Close()
-
+	tempDir := os.TempDir()
+	testFile, err := os.CreateTemp(tempDir, "test-*")
+	if err != nil {
+		log.Printf("一時ディレクトリに書き込めません: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "一時ディレクトリに書き込めません"})
+		return
+	}
+	testFile.Close()
+	os.Remove(testFile.Name())
+	entries, err := FileStorage.ListDirectory(repo.UUID, "")
+	if err != nil {
+		log.Printf("リポジトリ %s のディレクトリ一覧取得エラー: %v", repo.UUID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "リポジトリ内容の読み取りに失敗しました"})
+		return
+	}
 	// ZIPファイルの名前を決定
 	zipName := fmt.Sprintf("%s-%s.zip", username, repo.Name)
+	if len(entries) == 0 {
+		// リポジトリが空の場合は空のZIPファイルを作成
+		zipWriter.Close()
+		tempFile.Seek(0, 0)
+
+		c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%s", zipName))
+		c.Header("Content-Type", "application/zip")
+		c.Stream(func(w io.Writer) bool {
+			_, err := io.Copy(w, tempFile)
+			if err != nil {
+				log.Printf("空のZIPファイルのストリーミングエラー: %v", err)
+			}
+			return false
+		})
+		return
+	}
+	zipWriter.Close()
 
 	// ファイルの先頭に移動
 	tempFile.Seek(0, 0)
@@ -317,10 +352,35 @@ func addFilesToZip(zipWriter *zip.Writer, storage storage.Storage, repoUUID, dir
 	for _, entry := range entries {
 		fullPath := filepath.Join(dirPath, entry)
 		inZipPath := filepath.Join(zipPath, entry)
+		isDirectory := false
 
-		// ディレクトリかファイルかを判断（末尾が/ならディレクトリと仮定）
+		// 1. 末尾が/で終わるものはディレクトリ
 		if strings.HasSuffix(entry, "/") {
-			// ディレクトリの場合は再帰呼び出し
+			isDirectory = true
+			// 末尾の/を削除（ディレクトリパスの重複を防ぐ）
+			entry = strings.TrimSuffix(entry, "/")
+			fullPath = filepath.Join(dirPath, entry)
+			inZipPath = filepath.Join(zipPath, entry)
+		} else {
+			// 2. GetFileでエラーになり、そのエラーがディレクトリであることを示す場合
+			_, fileErr := storage.GetFile(repoUUID, fullPath)
+			if fileErr != nil && (strings.Contains(fileErr.Error(), "is a directory") ||
+				strings.Contains(fileErr.Error(), "directory")) {
+				isDirectory = true
+			}
+		}
+
+		if isDirectory {
+			// ディレクトリの場合はZIPにディレクトリエントリを追加
+			// 末尾に/を追加してディレクトリであることを明示
+			_, err := zipWriter.Create(inZipPath + "/")
+			if err != nil {
+				return err
+			}
+
+			// 空のディレクトリエントリなので内容は書き込まない
+
+			// 次に、ディレクトリの中身を再帰的に追加
 			err = addFilesToZip(zipWriter, storage, repoUUID, fullPath, inZipPath)
 			if err != nil {
 				return err
@@ -329,19 +389,19 @@ func addFilesToZip(zipWriter *zip.Writer, storage storage.Storage, repoUUID, dir
 			// ファイルの場合はZIPに追加
 			fileContent, err := storage.GetFile(repoUUID, fullPath)
 			if err != nil {
-				return err
+				return fmt.Errorf("ファイル %s の読み込みエラー: %w", fullPath, err)
 			}
 
 			// ZIPエントリを作成
 			zipEntry, err := zipWriter.Create(inZipPath)
 			if err != nil {
-				return err
+				return fmt.Errorf("ZIP エントリの作成エラー %s: %w", inZipPath, err)
 			}
 
 			// ファイル内容を書き込み
 			_, err = zipEntry.Write(fileContent)
 			if err != nil {
-				return err
+				return fmt.Errorf("ファイル内容の書き込みエラー %s: %w", inZipPath, err)
 			}
 		}
 	}
