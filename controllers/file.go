@@ -304,15 +304,6 @@ func ZipDownloadHandler(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "ZIPファイルの作成に失敗しました"})
 		return
 	}
-	tempDir := os.TempDir()
-	testFile, err := os.CreateTemp(tempDir, "test-*")
-	if err != nil {
-		log.Printf("一時ディレクトリに書き込めません: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "一時ディレクトリに書き込めません"})
-		return
-	}
-	testFile.Close()
-	os.Remove(testFile.Name())
 	entries, err := FileStorage.ListDirectory(repo.UUID, "")
 	if err != nil {
 		log.Printf("リポジトリ %s のディレクトリ一覧取得エラー: %v", repo.UUID, err)
