@@ -28,11 +28,16 @@ func UploadFileHandler(c *gin.Context) {
 		repoName = "New Repository"
 	}
 	publicFlag := c.PostForm("public") == "true"
-
+	downloadAllowedFlag := c.PostForm("download_allowed") == "true"
+	// 非公開リポジトリなら、ダウンロード許可を常に無効にする
+	if !publicFlag {
+		downloadAllowedFlag = false
+	}
 	newRepo := models.Repository{
-		OwnerID: userID,
-		Name:    repoName,
-		Public:  publicFlag,
+		OwnerID:         userID,
+		Name:            repoName,
+		Public:          publicFlag,
+		DownloadAllowed: downloadAllowedFlag,
 	}
 	if err := DB.Create(&newRepo).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create repository"})
