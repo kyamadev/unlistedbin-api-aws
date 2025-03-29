@@ -11,18 +11,15 @@ import (
 	"gorm.io/gorm"
 
 	"Unlistedbin-api/config"
-	"Unlistedbin-api/controllers"
-	"Unlistedbin-api/middleware"
 	"Unlistedbin-api/models"
 	"Unlistedbin-api/storage"
 )
 
 type TestEnv struct {
-	DB            *gorm.DB
-	Router        *gin.Engine
-	CognitoClient *controllers.CognitoClient
-	JWTValidator  *middleware.CognitoJWTValidator
-	Storage       storage.Storage
+	DB        *gorm.DB
+	Router    *gin.Engine
+	Storage   storage.Storage
+	ConfigDir string
 }
 
 func SetupTestEnvironment(t *testing.T) *TestEnv {
@@ -33,10 +30,8 @@ func SetupTestEnvironment(t *testing.T) *TestEnv {
 
 	var envPath string
 	if filepath.Base(currentDir) == "test" {
-		// test/ディレクトリから実行している場合
 		envPath = "../.env.test"
 	} else {
-		// プロジェクトルートから実行している場合
 		envPath = "./.env.test"
 	}
 
@@ -64,37 +59,19 @@ func SetupTestEnvironment(t *testing.T) *TestEnv {
 
 	fileStorage := storage.NewLocalStorage(testStoragePath)
 
-	controllers.DB = db
-	controllers.FileStorage = fileStorage
-
-	cognitoClient, err := controllers.NewCognitoClient(
-		config.AppConfig.CognitoRegion,
-		config.AppConfig.CognitoUserPoolID,
-		config.AppConfig.CognitoClientID,
-	)
-	if err != nil {
-		t.Fatalf("Failed to create Cognito client: %v", err)
-	}
-
-	jwtValidator := middleware.NewCognitoJWTValidator(
-		config.AppConfig.CognitoRegion,
-		config.AppConfig.CognitoUserPoolID,
-		config.AppConfig.CognitoClientID,
-	)
-
 	gin.SetMode(gin.TestMode)
 	r := gin.Default()
 
 	return &TestEnv{
-		DB:            db,
-		Router:        r,
-		CognitoClient: cognitoClient,
-		JWTValidator:  jwtValidator,
-		Storage:       fileStorage,
+		DB:        db,
+		Router:    r,
+		Storage:   fileStorage,
+		ConfigDir: testStoragePath,
 	}
 }
 
-func CleanupTestEnvironment(env *TestEnv) {
-	testStoragePath := os.TempDir() + "/unlistedbin-test-storage"
-	os.RemoveAll(testStoragePath)
+func CleanupTestEnvironment(testEnv *TestEnv) {
+	if testEnv != nil && testEnv.ConfigDir != "" {
+		os.RemoveAll(testEnv.ConfigDir)
+	}
 }
